@@ -9,23 +9,24 @@ from typing import Optional
 
 # --- CONFIGURATION --------------------------------------------------------
 # Utility settings: 'exponential', 'power', or 'log'
-UTILITY_TYPE = 'exponential'
+UTILITY_TYPE = 'exponential' 
 ALPHAS = [0.5, 1.0, 2.0, 5.0]   # for exponential (α)
 GAMMAS = [0.5, 1.0, 2.0, 5.0]   # for power (γ)
-LOG_PARAMS = [None]            
+LOG_PARAMS = [None]        
 
 # Liability scenarios
 SCENARIOS = [
     ('constant',          {'const_value': 0.5}),
     ('normal',            {'normal_mu': 0.5, 'normal_sigma': 1.0}),
-    ('hedgable_gaussian', {'mu_F': 0.5,     'sigma_F': 1.0}),
+    ('hedgable_gaussian', {'mu_F': 0.5, 'sigma_F': 1.0}),
 ]
-# Monte Carlo samples
+
+# Monte-Carlo samples
 MC_SAMPLES = 500_000
 
-# Grid-search settings: narrower around analytic π*
+# Grid-search
 GRID_PTS = 500
-GRID_WINDOW_RATIO = 0.1
+GRID_WINDOW_RATIO = 0.1  # ±10% around analytic  # ±25% around analytic
 
 # --------------------------------------------------------------------------
 def compute_analytic_pi(
@@ -86,33 +87,42 @@ def test_strategy(
     """
     For each risk parameter, compute analytic and numeric π* for the chosen utility.
     """
-    # Select parameter list
-    if UTILITY_TYPE == 'exponential': params = ALPHAS
-    elif UTILITY_TYPE == 'power':     params = GAMMAS
-    else:                              params = [None]
+    # Choose risk parameter list
+    if UTILITY_TYPE == 'exponential':
+        risk_list = ALPHAS
+    elif UTILITY_TYPE == 'power':
+        risk_list = GAMMAS
+    else:
+        risk_list = [None]
 
+    # Pre-simulate W_T
     W_T = simulate_WT(T, MC_SAMPLES, seed=42)
     results = []
 
-    for rp in params:
+    for rp in risk_list:
+        # Compute analytic π*
         analytic = compute_analytic_pi(
             UTILITY_TYPE, distribution, dist_params,
             rp, b, sigma, T, x0
         )
-        # Default Merton center if analytic unavailable
+        # Center and grid
         center = analytic if analytic is not None else b/(sigma**2)
-        width = GRID_WINDOW_RATIO * abs(center)
-        pi_grid = np.linspace(center-width, center+width, GRID_PTS)
+        half_width = GRID_WINDOW_RATIO * abs(center)
+        pi_grid = np.linspace(center - half_width,
+                               center + half_width,
+                               GRID_PTS)
 
-        # Compute numeric optimum
+        # Numeric search
         if UTILITY_TYPE == 'exponential':
             pi_num, eu_vals = find_optimal_pi(
                 pi_grid, W_T,
                 distribution, dist_params,
-                x0, b, sigma, rp, T, seed=42
+                x0, b, sigma, rp, T,
+                seed=42
             )
+
         elif UTILITY_TYPE == 'power':
-            # build liability vector
+            # Build liability F_vec
             M = W_T.shape[0]
             if distribution == 'hedgable_gaussian':
                 muF, sigmaF = dist_params['mu_F'], dist_params['sigma_F']
@@ -121,15 +131,18 @@ def test_strategy(
             elif distribution == 'normal':
                 F_vec = np.zeros(M)
             else:
-                F_vec = generate_F(M, distribution, **dist_params, seed=42)
+                F_vec = generate_F(M, distribution,
+                                    **dist_params, seed=42)
+            # Monte-Carlo GBM power utility
             eu_vals = np.array([
                 expected_power_utility(pi, W_T, F_vec,
                                         x0, b, sigma, rp, T)
                 for pi in pi_grid
             ])
-            pi_num = pi_grid[eu_vals.argmax()]
-        else:  # log
-            # build liability vector
+            pi_num = pi_grid[np.argmax(eu_vals)]
+
+        else:  # logarithmic
+            # Build liability F_vec
             M = W_T.shape[0]
             if distribution == 'hedgable_gaussian':
                 muF, sigmaF = dist_params['mu_F'], dist_params['sigma_F']
@@ -138,16 +151,18 @@ def test_strategy(
             elif distribution == 'normal':
                 F_vec = np.zeros(M)
             else:
-                F_vec = generate_F(M, distribution, **dist_params, seed=42)
-            # numeric search for log-utility
+                F_vec = generate_F(M, distribution,
+                                    **dist_params, seed=42)
+            # Grid search for log utility
             eu_vals = np.array([
                 expected_log_utility(pi, W_T, F_vec,
                                       x0, b, sigma, T)
                 for pi in pi_grid
             ])
-            pi_num = pi_grid[eu_vals.argmax()]
+            pi_num = pi_grid[np.argmax(eu_vals)]
 
-        print(f"{distribution} | {UTILITY_TYPE} param={rp}: analytic={analytic}, numeric={pi_num:.2f}")
+        print(f"{distribution} | {UTILITY_TYPE} param={rp}: "
+              f"analytic={analytic}, numeric={pi_num:.2f}")
         results.append((rp, analytic, pi_num, pi_grid, eu_vals))
 
     return results
@@ -170,6 +185,7 @@ def plot_results(
     pi_common = np.linspace(pi_min, pi_max, GRID_PTS)
 
     W_T = simulate_WT(T, MC_SAMPLES, seed=123)
+    # prepare liability vector
     if distribution == 'hedgable_gaussian':
         muF, sigmaF = dist_params['mu_F'], dist_params['sigma_F']
         kappa = sigmaF / np.sqrt(T)
@@ -198,6 +214,7 @@ def plot_results(
             label = "MC log"
 
         plt.plot(pi_common, U_common, label=label)
+        # numeric and analytic markers
         plt.axvline(pi_num, color='k', linestyle='--',
                     label=f"Numeric π* (param={rp})")
         if analytic is not None:

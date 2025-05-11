@@ -67,7 +67,7 @@ def expected_power_utility(pi: float,
     U = np.empty_like(S)
     mask = S > 0
     U[mask] = S[mask]**gamma / gamma
-    U[~mask] = -1e10  # large penalty for bankruptcy
+    U[~mask] = 0
     return U.mean()
 
 def expected_log_utility(pi: float,
@@ -94,9 +94,8 @@ def expected_log_utility(pi: float,
     # compute log‐utility, penalize non‐positive surplus
     U = np.empty_like(S)
     mask = S > 0
-    U[mask]   = np.log(S[mask])
-    U[~mask]  = 0   # heavy penalty for bankruptcy
-
+    U[mask] = np.log(S[mask])
+    U[~mask] = 0  
     return U.mean()
 
 
@@ -128,18 +127,13 @@ def find_optimal_pi(pi_grid: np.ndarray,
         kappa = sigma_F / np.sqrt(T)
         F_vec = mu_F + kappa * W_T
 
-    # Independent normal liability: no exposure to W_T
     elif distribution == "normal":
         F_vec = np.zeros(M)
-
-    # Constant liability
     elif distribution == "constant":
         F_vec = generate_F(M, distribution, **dist_params, seed=seed)
-
     else:
         raise ValueError(f"Unsupported distribution '{distribution}' in find_optimal_pi")
-
-    # Evaluate expected utility across the grid
+    
     eu_vals = np.array([
         expected_utility(pi, W_T, F_vec, x0, b, sigma, alpha, T)
         for pi in pi_grid
