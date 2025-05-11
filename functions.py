@@ -1,6 +1,4 @@
 import numpy as np
-import matplotlib.pyplot as plt
-
 
 def simulate_WT(T: float, M: int, seed: int = None) -> np.ndarray:
     """Draw M samples of W_T ~ N(0, T)."""
@@ -46,29 +44,48 @@ def expected_utility(pi: float,
     return U.mean()
 
 
-def expected_power_utility(pi: float,
-                           W_T: np.ndarray,
-                           F_vec: np.ndarray,
+def expected_power_utility(pi,     # π ignored, since we use the analytic π*
+                           W_T,    # W_T used to infer kappa if needed
+                           F_vec,  # F_vec has liability samples
                            x0: float,
                            b: float,
                            sigma: float,
                            gamma: float,
                            T: float) -> float:
     """
-    Compute E[(X_T - F)^gamma / gamma] under a multiplicative GBM model.
-    Model: wealth follows dX = π X (b dt + σ dW), so
-      X_T = x0 * exp((π b - 0.5 π^2 σ^2) T + π σ W_T).
-    Utility U = (X_T - F_vec)^γ / γ, with heavy penalty if X_T <= F.
+    Analytic value function for CRRA (power) utility with bounded liability F.
+
+    Returns V(x0) = (x0 - Y0)^gamma / gamma, where Y0 is the BSDE certainty equivalent:
+      - constant F:      F̄ - (γ/[2(1-γ)]) θ^2 T
+      - hedgeable Gaussian F=μ_F+κW_T:
+                          μ_F - κθ T - (γ/[2(1-γ)]) θ^2 T
     """
-    # Terminal wealth under Merton fraction π
-    X_T = x0 * np.exp((pi * b - 0.5 * pi**2 * sigma**2) * T + pi * sigma * W_T)
-    # Surplus above liability
-    S = X_T - F_vec
-    U = np.empty_like(S)
-    mask = S > 0
-    U[mask] = S[mask]**gamma / gamma
-    U[~mask] = 0
-    return U.mean()
+    if abs(gamma - 1.0) < 1e-8:
+      # avoid division by zero; use log-utility closed-form
+      return expected_log_utility(pi, W_T, F_vec, x0, b, sigma, T)
+    theta = b / sigma
+
+    # average liability
+    try:
+      barF = float(np.mean(F_vec))
+    except:
+      barF = 0.0
+
+    # determine if hedgeable Gaussian (nonzero variance in F_vec)
+    if np.std(F_vec) > 1e-8:
+      mu_F = np.mean(F_vec)
+      # infer kappa via covariance with W_T
+      cov = np.cov(F_vec, W_T, bias=True)[0,1]
+      varW = np.var(W_T)
+      kappa = cov / varW if varW>0 else 0.0
+      # Y0 from Gaussian liability
+      Y0 = mu_F - kappa * theta * T - (gamma/(2*(1-gamma))) * theta**2 * T
+    else:
+      # Y0 for constant liability
+      Y0 = barF - (gamma/(2*(1-gamma))) * theta**2 * T
+
+    H0 = x0 - Y0
+    return H0**gamma / gamma
 
 def expected_log_utility(pi: float,
                          W_T: np.ndarray,

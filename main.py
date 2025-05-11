@@ -9,11 +9,11 @@ from typing import Optional
 
 # --- CONFIGURATION --------------------------------------------------------
 # Utility settings: 'exponential', 'power', or 'log'
-UTILITY_TYPE = 'exponential' 
+UTILITY_TYPE = 'power' 
 ALPHAS = [0.5, 1.0, 2.0, 5.0]   # for exponential (α)
 GAMMAS = [0.5, 1.0, 2.0, 5.0]   # for power (γ)
 LOG_PARAMS = [None]        
-
+ 
 # Liability scenarios
 SCENARIOS = [
     ('constant',          {'const_value': 0.5}),
@@ -56,7 +56,7 @@ def compute_analytic_pi(
     if utility == 'power':
         gamma = risk_param
         if abs(gamma - 1.0) < 1e-8:
-            return None
+            return b/sigma
         barF = params.get('const_value', params.get('normal_mu', 0.0))
         theta2 = theta**2
         Y0 = barF + (gamma/(2*(1-gamma))) * theta2 * T
@@ -232,7 +232,28 @@ def plot_results(
 # --------------------------------------------------------------------------
 if __name__=='__main__':
     T, b, sigma, x0 = 1.0, 0.1, 0.2, 1.0
-    for dist, dp in SCENARIOS:
-        print(f"\n--- Scenario: {dist} ---")
-        res = test_strategy(T, b, sigma, x0, dist, dp)
-        plot_results(res, T, b, sigma, x0, dist, dp)
+
+    # Store per-scenario results
+    all_results = {}
+
+    for distribution, dist_params in SCENARIOS:
+        print(f"--- Scenario: {distribution} ---")
+        results = test_strategy(T, b, sigma, x0, distribution, dist_params)
+        all_results[distribution] = results
+        plot_results(results, T, b, sigma, x0, distribution, dist_params)
+
+        # # Exponential: π* vs α for this scenario
+        # if UTILITY_TYPE == 'exponential':
+        #     alphas = [rp for rp, *_ in results]
+        #     analytic_pis = [analytic for _, analytic, *_ in results]
+        #     numeric_pis = [pi_num for *_, pi_num, _, _ in results]
+        #     plt.figure(figsize=(6,4))
+        #     plt.plot(alphas, analytic_pis, 'o-', label='Analytic π*')
+        #     plt.plot(alphas, numeric_pis, 's--', label='Numeric π*')
+        #     plt.xlabel('Risk aversion α')
+        #     plt.ylabel('Optimal π*')
+        #     plt.title(f'Optimal π* vs α — {distribution}')
+        #     plt.legend()
+        #     plt.grid(True)
+        #     plt.tight_layout()
+        #     plt.show()
