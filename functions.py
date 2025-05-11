@@ -46,6 +46,31 @@ def expected_utility(pi: float,
     return U.mean()
 
 
+def expected_power_utility(pi: float,
+                           W_T: np.ndarray,
+                           F_vec: np.ndarray,
+                           x0: float,
+                           b: float,
+                           sigma: float,
+                           gamma: float,
+                           T: float) -> float:
+    """
+    Compute E[(X_T - F)^gamma / gamma] under a multiplicative GBM model.
+    Model: wealth follows dX = π X (b dt + σ dW), so
+      X_T = x0 * exp((π b - 0.5 π^2 σ^2) T + π σ W_T).
+    Utility U = (X_T - F_vec)^γ / γ, with heavy penalty if X_T <= F.
+    """
+    # Terminal wealth under Merton fraction π
+    X_T = x0 * np.exp((pi * b - 0.5 * pi**2 * sigma**2) * T + pi * sigma * W_T)
+    # Surplus above liability
+    S = X_T - F_vec
+    U = np.empty_like(S)
+    mask = S > 0
+    U[mask] = S[mask]**gamma / gamma
+    U[~mask] = -1e10  # large penalty for bankruptcy
+    return U.mean()
+
+
 def find_optimal_pi(pi_grid: np.ndarray,
                     W_T: np.ndarray,
                     distribution: str,
@@ -67,33 +92,30 @@ def find_optimal_pi(pi_grid: np.ndarray,
     """
     M = W_T.shape[0]
 
-    # 1) Hedgeable Gaussian liability: F depends on W_T
+    # Hedgeable Gaussian liability: F depends on W_T
     if distribution == "hedgable_gaussian":
         mu_F = dist_params.get("mu_F", 0.0)
         sigma_F = dist_params.get("sigma_F", 0.0)
-        # Scaling factor so that Var[kappa * W_T] = sigma_F^2
         kappa = sigma_F / np.sqrt(T)
-        # F = mu_F + kappa * W_T
         F_vec = mu_F + kappa * W_T
 
-    # 2) Independent normal liability: no exposure to W_T, hedging term drops out
+    # Independent normal liability: no exposure to W_T
     elif distribution == "normal":
-        # For purely independent F, the optimal pi is analytic and independent of F
         F_vec = np.zeros(M)
 
-    # 3) Constant liability
+    # Constant liability
     elif distribution == "constant":
         F_vec = generate_F(M, distribution, **dist_params, seed=seed)
 
     else:
         raise ValueError(f"Unsupported distribution '{distribution}' in find_optimal_pi")
 
+    # Evaluate expected utility across the grid
     eu_vals = np.array([
         expected_utility(pi, W_T, F_vec, x0, b, sigma, alpha, T)
         for pi in pi_grid
     ])
 
-    # Pick the pi that maximizes expected utility
     best_pi = pi_grid[eu_vals.argmax()]
     return best_pi, eu_vals
 
