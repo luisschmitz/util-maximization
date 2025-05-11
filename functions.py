@@ -70,6 +70,35 @@ def expected_power_utility(pi: float,
     U[~mask] = -1e10  # large penalty for bankruptcy
     return U.mean()
 
+def expected_log_utility(pi: float,
+                         W_T: np.ndarray,
+                         F_vec: np.ndarray,
+                         x0: float,
+                         b: float,
+                         sigma: float,
+                         T: float) -> float:
+    """
+    Compute E[log(X_T - F)] under a multiplicative GBM model:
+      dX_t = π X_t (b dt + σ dW_t),
+    so
+      X_T = x0 * exp((π b - 0.5 π^2 σ^2) T + π σ W_T).
+
+    Utility is log(X_T - F_vec), with a large negative penalty if X_T <= F.
+    """
+    # simulate terminal wealth
+    X_T = x0 * np.exp((pi * b - 0.5 * pi**2 * sigma**2) * T + pi * sigma * W_T)
+
+    # surplus above the liability
+    S = X_T - F_vec
+
+    # compute log‐utility, penalize non‐positive surplus
+    U = np.empty_like(S)
+    mask = S > 0
+    U[mask]   = np.log(S[mask])
+    U[~mask]  = 0   # heavy penalty for bankruptcy
+
+    return U.mean()
+
 
 def find_optimal_pi(pi_grid: np.ndarray,
                     W_T: np.ndarray,
@@ -118,19 +147,3 @@ def find_optimal_pi(pi_grid: np.ndarray,
 
     best_pi = pi_grid[eu_vals.argmax()]
     return best_pi, eu_vals
-
-
-def plot_utilities(pi_grid: np.ndarray,
-                   eu_vals: np.ndarray,
-                   title: str,
-                   pi_opt: float = None) -> None:
-    """Plot expected utility vs π and mark the optimal π if provided."""
-    plt.plot(pi_grid, eu_vals, label=title)
-    if pi_opt is not None:
-        plt.axvline(pi_opt, color='r', linestyle='--', label=f"Optimal π ≈ {pi_opt:.2f}")
-    plt.title(title)
-    plt.xlabel("π")
-    plt.ylabel("Expected Utility")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
