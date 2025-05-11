@@ -1,200 +1,238 @@
-from functions import *
 import numpy as np
 import matplotlib.pyplot as plt
+from functions import (
+    simulate_WT, generate_F,
+    expected_utility, expected_power_utility, expected_log_utility,
+    find_optimal_pi
+)
+from typing import Optional
 
-def test_multiple_alphas(alphas, T, M, b, sigma, x0, distribution, dist_params, paths_seed, grid_points=300):
+# --- CONFIGURATION --------------------------------------------------------
+# Utility settings: 'exponential', 'power', or 'log'
+UTILITY_TYPE = 'exponential' 
+ALPHAS = [0.5, 1.0, 2.0, 5.0]   # for exponential (α)
+GAMMAS = [0.5, 1.0, 2.0, 5.0]   # for power (γ)
+LOG_PARAMS = [None]        
+
+# Liability scenarios
+SCENARIOS = [
+    ('constant',          {'const_value': 0.5}),
+    ('normal',            {'normal_mu': 0.5, 'normal_sigma': 1.0}),
+    ('hedgable_gaussian', {'mu_F': 0.5, 'sigma_F': 1.0}),
+]
+
+# Monte-Carlo samples
+MC_SAMPLES = 500_000
+
+# Grid-search
+GRID_PTS = 500
+GRID_WINDOW_RATIO = 0.1  # ±10% around analytic  # ±25% around analytic
+
+# --------------------------------------------------------------------------
+def compute_analytic_pi(
+    utility: str,
+    dist: str,
+    params: dict,
+    risk_param: Optional[float],
+    b: float,
+    sigma: float,
+    T: float,
+    x0: float
+) -> Optional[float]:
     """
-    For each alpha in alphas, compute analytic and numeric optimal pi,
-    using an adaptive search grid around the analytic value.
-    Returns a list of result dicts.
+    Compute the closed-form optimal π* for exponential, power, or log utility.
+    Returns None if no simple analytic form is implemented.
     """
-    W_T = simulate_WT(T, M, seed=paths_seed)
+    theta = b / sigma
+    # Exponential
+    if utility == 'exponential':
+        alpha = risk_param
+        if dist == 'hedgable_gaussian':
+            kappa = params['sigma_F'] / np.sqrt(T)
+            return kappa/sigma + b/(alpha * sigma**2)
+        return b/(alpha * sigma**2)
+
+    # Power
+    if utility == 'power':
+        gamma = risk_param
+        if abs(gamma - 1.0) < 1e-8:
+            return None
+        barF = params.get('const_value', params.get('normal_mu', 0.0))
+        theta2 = theta**2
+        Y0 = barF + (gamma/(2*(1-gamma))) * theta2 * T
+        H0 = x0 - Y0
+        base = (b/(sigma**2)) * (H0/(1-gamma))
+        if dist == 'hedgable_gaussian':
+            muF = params['mu_F']; sigmaF = params['sigma_F']
+            kappa = sigmaF / np.sqrt(T)
+            base += kappa/sigma
+        return base
+
+    # Logarithmic
+    if utility == 'log':
+        # analytic π* = theta, independent of liability
+        return theta
+
+    return None
+
+# --------------------------------------------------------------------------
+def test_strategy(
+    T: float,
+    b: float,
+    sigma: float,
+    x0: float,
+    distribution: str,
+    dist_params: dict
+):
+    """
+    For each risk parameter, compute analytic and numeric π* for the chosen utility.
+    """
+    # Choose risk parameter list
+    if UTILITY_TYPE == 'exponential':
+        risk_list = ALPHAS
+    elif UTILITY_TYPE == 'power':
+        risk_list = GAMMAS
+    else:
+        risk_list = [None]
+
+    # Pre-simulate W_T
+    W_T = simulate_WT(T, MC_SAMPLES, seed=42)
     results = []
-    for alpha in alphas:
-        analytic_pi = b / (alpha * sigma**2)
-        # adaptive grid around analytic optimum
-        window = max(1.0, 0.5 * analytic_pi)
-        lower = max(0.0, analytic_pi - window)
-        upper = analytic_pi + window
-        pi_grid_alpha = np.linspace(lower, upper, grid_points)
 
-        pi_det, eu_vals = find_optimal_pi(
-            pi_grid_alpha, W_T,
-            distribution, dist_params,
-            x0, b, sigma, alpha, T,
-            seed=paths_seed
+    for rp in risk_list:
+        # Compute analytic π*
+        analytic = compute_analytic_pi(
+            UTILITY_TYPE, distribution, dist_params,
+            rp, b, sigma, T, x0
         )
-        results.append({
-            "alpha": alpha,
-            "analytic_pi": analytic_pi,
-            "numeric_pi": pi_det,
-            "pi_grid": pi_grid_alpha,
-            "eu_vals": eu_vals
-        })
-        print(f"[{distribution}] alpha={alpha:.2f}: analytic π*={analytic_pi:.2f}, numeric π*={pi_det:.2f}")
+        # Center and grid
+        center = analytic if analytic is not None else b/(sigma**2)
+        half_width = GRID_WINDOW_RATIO * abs(center)
+        pi_grid = np.linspace(center - half_width,
+                               center + half_width,
+                               GRID_PTS)
+
+        # Numeric search
+        if UTILITY_TYPE == 'exponential':
+            pi_num, eu_vals = find_optimal_pi(
+                pi_grid, W_T,
+                distribution, dist_params,
+                x0, b, sigma, rp, T,
+                seed=42
+            )
+
+        elif UTILITY_TYPE == 'power':
+            # Build liability F_vec
+            M = W_T.shape[0]
+            if distribution == 'hedgable_gaussian':
+                muF, sigmaF = dist_params['mu_F'], dist_params['sigma_F']
+                kappa = sigmaF / np.sqrt(T)
+                F_vec = muF + kappa * W_T
+            elif distribution == 'normal':
+                F_vec = np.zeros(M)
+            else:
+                F_vec = generate_F(M, distribution,
+                                    **dist_params, seed=42)
+            # Monte-Carlo GBM power utility
+            eu_vals = np.array([
+                expected_power_utility(pi, W_T, F_vec,
+                                        x0, b, sigma, rp, T)
+                for pi in pi_grid
+            ])
+            pi_num = pi_grid[np.argmax(eu_vals)]
+
+        else:  # logarithmic
+            # Build liability F_vec
+            M = W_T.shape[0]
+            if distribution == 'hedgable_gaussian':
+                muF, sigmaF = dist_params['mu_F'], dist_params['sigma_F']
+                kappa = sigmaF / np.sqrt(T)
+                F_vec = muF + kappa * W_T
+            elif distribution == 'normal':
+                F_vec = np.zeros(M)
+            else:
+                F_vec = generate_F(M, distribution,
+                                    **dist_params, seed=42)
+            # Grid search for log utility
+            eu_vals = np.array([
+                expected_log_utility(pi, W_T, F_vec,
+                                      x0, b, sigma, T)
+                for pi in pi_grid
+            ])
+            pi_num = pi_grid[np.argmax(eu_vals)]
+
+        print(f"{distribution} | {UTILITY_TYPE} param={rp}: "
+              f"analytic={analytic}, numeric={pi_num:.2f}")
+        results.append((rp, analytic, pi_num, pi_grid, eu_vals))
+
     return results
 
-
-def plot_combined_alpha(results, T, M, b, sigma, x0, distribution, dist_params):
+# --------------------------------------------------------------------------
+def plot_results(
+    results,
+    T: float,
+    b: float,
+    sigma: float,
+    x0: float,
+    distribution: str,
+    dist_params: dict
+):
     """
-    Plot overlaid expected utility curves for different alphas, with analytic
-    and numeric pi* annotations, plus analytic closed-form utility.
+    Plot MC utility curves and mark numeric/analytic π* on a common π axis.
     """
-    pi_min = min(r["pi_grid"][0] for r in results)
-    pi_max = max(r["pi_grid"][-1] for r in results)
-    pi_grid_common = np.linspace(pi_min, pi_max, 400)
-    W_T_common = simulate_WT(T, M, seed=42)
+    pi_min = min(pi[0] for _, _, _, pi, _ in results)
+    pi_max = max(pi[-1] for _, _, _, pi, _ in results)
+    pi_common = np.linspace(pi_min, pi_max, GRID_PTS)
 
-    plt.figure(figsize=(8, 5))
-    for r in results:
-        alpha = r["alpha"]
-        analytic_pi = r["analytic_pi"]
-        numeric_pi = r["numeric_pi"]
-        if distribution == "constant":
-            F_vec = np.full_like(W_T_common, dist_params["const_value"])
-            Y0 = dist_params["const_value"] - T * (b/sigma)**2 / (2 * alpha)
+    W_T = simulate_WT(T, MC_SAMPLES, seed=123)
+    # prepare liability vector
+    if distribution == 'hedgable_gaussian':
+        muF, sigmaF = dist_params['mu_F'], dist_params['sigma_F']
+        kappa = sigmaF / np.sqrt(T)
+        F_vec = muF + kappa * W_T
+    elif distribution == 'normal':
+        F_vec = np.zeros_like(W_T)
+    else:
+        F_vec = generate_F(len(W_T), distribution, **dist_params, seed=123)
+
+    plt.figure(figsize=(8,5))
+    for rp, analytic, pi_num, _, _ in results:
+        if UTILITY_TYPE == 'exponential':
+            U_common = [expected_utility(pi, W_T, F_vec,
+                                         x0, b, sigma, rp, T)
+                        for pi in pi_common]
+            label = f"MC α={rp:.2f}"
+        elif UTILITY_TYPE == 'power':
+            U_common = [expected_power_utility(pi, W_T, F_vec,
+                                              x0, b, sigma, rp, T)
+                        for pi in pi_common]
+            label = f"MC γ={rp:.2f}"
         else:
-            F_vec = np.zeros_like(W_T_common)
-            mu = dist_params.get("normal_mu", 0)
-            Y0 = mu - T * (b/sigma)**2 / (2 * alpha)
-        # Monte-Carlo utility
-        eu_vals = [expected_utility(pi, W_T_common, F_vec, x0, b, sigma, alpha, T)
-                   for pi in pi_grid_common]
-        plt.plot(pi_grid_common, eu_vals,
-                 label=f"MC α={alpha} (num={numeric_pi:.2f})")
-        plt.axvline(analytic_pi, linestyle='--', color='k')
-        idx = np.argmin(np.abs(pi_grid_common - numeric_pi))
-        plt.plot(numeric_pi, eu_vals[idx], 'o', color='k')
-        # analytic closed-form utility curve
-        U_ana = -np.exp(-alpha * (x0 - Y0 + pi_grid_common * b * T))
-        plt.plot(pi_grid_common, U_ana, linestyle=':', label=f"Ana α={alpha}")
+            U_common = [expected_log_utility(pi, W_T, F_vec,
+                                            x0, b, sigma, T)
+                        for pi in pi_common]
+            label = "MC log"
+
+        plt.plot(pi_common, U_common, label=label)
+        # numeric and analytic markers
+        plt.axvline(pi_num, color='k', linestyle='--',
+                    label=f"Numeric π* (param={rp})")
+        if analytic is not None:
+            plt.axvline(analytic, color='r', linestyle=':',
+                        label=f"Analytic π* (param={rp})")
 
     plt.xlabel('π')
     plt.ylabel('Expected Utility')
-    plt.title(f'Expected vs Analytic Utility vs π — {distribution.capitalize()} Liability')
+    plt.title(f"{UTILITY_TYPE.title()} Utility — {distribution}")
     plt.legend(fontsize='small', ncol=2)
     plt.grid(True)
     plt.tight_layout()
     plt.show()
 
-
-def simulate_utility_paths(alpha, pi_star, T, N, Msim, b, sigma, x0, F):
-    """
-    Simulate Msim sample paths of U_t under rebalanced strategy π_star or time-varying π.
-    Returns U array shape (Msim, N+1).
-    """
-    dt = T / N
-    rng = np.random.default_rng(123)
-    dW = rng.normal(0, np.sqrt(dt), size=(Msim, N))
-    X = np.zeros((Msim, N+1))
-    X[:, 0] = x0
-    for k in range(N):
-        X[:, k+1] = X[:, k] + pi_star[k] * (b[k] * dt + sigma[k] * dW[:, k])
-    F_mat = F.reshape(Msim, 1)
-    U = -np.exp(-alpha * (X - F_mat))
-    return U
-
-
-def plot_time_varying_strategy(alphas, T, N, b_func, sigma_func, x0):
-    """
-    Plot dynamic optimal π*(t) for time-varying b(t), σ(t) and simulate utility paths.
-    """
-    tgrid = np.linspace(0, T, N+1)
-    b_t = b_func(tgrid)
-    sigma_t = sigma_func(tgrid)
-
-    # Plot π*(t)
-    plt.figure(figsize=(8, 4))
-    for alpha in alphas:
-        pi_t = b_t / (alpha * sigma_t**2)
-        plt.plot(tgrid, pi_t, label=f"α={alpha}")
-    plt.xlabel('t')
-    plt.ylabel('π*(t)')
-    plt.title('Time-varying Optimal π*(t)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-
-    # Simulate utility paths under dynamic π*(t)
-    Msim = 2000
-    dt = T / N
-    tgrid = np.linspace(0, T, N+1)
-    for alpha in alphas:
-        pi_t = b_t / (alpha * sigma_t**2)
-        # constant liability for illustration
-        F = np.full(Msim, 0.5)
-        U = simulate_utility_paths(alpha, pi_t, T, N, Msim, b_t, sigma_t, x0, F)
-        # plot sample paths
-        plt.figure(figsize=(8, 4))
-        sel = np.random.default_rng(42).choice(Msim, size=5, replace=False)
-        for i in sel:
-            plt.plot(tgrid, U[i], alpha=0.6)
-        plt.xlabel('t')
-        plt.ylabel('U_t')
-        plt.title(f'Sample U_t Paths (α={alpha}) under Time-Varying b(t),σ(t)')
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-
-
-def main():
-    # Base parameters
-    T = 1.0
-    M = 100_000
-    b, sigma, x0 = 0.1, 0.2, 1.0
-    alphas = [0.5, 1.0, 2.0, 5.0]
-
-    # Scenarios
-    scenarios = [
-        ("constant", {"const_value": 0.5}),
-        ("normal",   {"normal_mu": 0.5, "normal_sigma": 1.0})
-    ]
-
-    # Static plots
-    for distribution, dist_params in scenarios:
-        print(f"\n--- Scenario: {distribution.capitalize()} Liability ---")
-        results = test_multiple_alphas(
-            alphas, T, M, b, sigma, x0,
-            distribution, dist_params,
-            paths_seed=42
-        )
-        plot_combined_alpha(results, T, M, b, sigma, x0,
-                            distribution, dist_params)
-
-    # Sample-path utility plots
-    N_steps, Msim = 200, 5000
-    tgrid = np.linspace(0, T, N_steps+1)
-    for distribution, dist_params in scenarios:
-        print(f"\n--- Sample Utility Paths under {distribution.capitalize()} Liability ---")
-        if distribution == "constant":
-            F_vec = np.full(Msim, dist_params["const_value"])
-        else:
-            F_vec = generate_F(Msim, distribution, **dist_params, seed=123)
-        plt.figure(figsize=(8, 5))
-        for alpha in alphas:
-            pi_star = b/(alpha*sigma**2)
-            U = simulate_utility_paths(alpha, pi_star * np.ones(N_steps+1), T, N_steps, Msim, b*np.ones(N_steps+1), sigma*np.ones(N_steps+1), x0, F_vec)
-            sel = np.random.default_rng(42).choice(Msim, size=5, replace=False)
-            for i in sel:
-                plt.plot(tgrid, U[i], alpha=0.6)
-        for alpha in alphas:
-            ps = b/(alpha*sigma**2)
-            plt.plot([], [], label=f"α={alpha}, π*={ps:.2f}")
-        plt.xlabel('t')
-        plt.ylabel('Utility U_t')
-        plt.title(f'Sample Paths of Utility Process under {distribution.capitalize()} Liability')
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-
-    # Time-varying b(t), sigma(t) demo
-    print("\n--- Time-Varying b(t), σ(t) Strategy ---")
-    N = 200
-    b_func = lambda t: 0.1 + 0.05 * np.sin(2 * np.pi * t / T)
-    sigma_func = lambda t: 0.2 + 0.1 * np.cos(2 * np.pi * t / T)
-    plot_time_varying_strategy(alphas, T, N, b_func, sigma_func, x0)
-
-if __name__ == "__main__":
-    main()
+# --------------------------------------------------------------------------
+if __name__=='__main__':
+    T, b, sigma, x0 = 1.0, 0.1, 0.2, 1.0
+    for dist, dp in SCENARIOS:
+        print(f"\n--- Scenario: {dist} ---")
+        res = test_strategy(T, b, sigma, x0, dist, dp)
+        plot_results(res, T, b, sigma, x0, dist, dp)
