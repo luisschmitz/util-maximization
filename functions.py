@@ -43,49 +43,108 @@ def expected_utility(pi: float,
     U = -np.exp(-alpha * (X_T - F_vec))
     return U.mean()
 
-
-def expected_power_utility(pi,     # π ignored, since we use the analytic π*
-                           W_T,    # W_T used to infer kappa if needed
-                           F_vec,  # F_vec has liability samples
-                           x0: float,
-                           b: float,
-                           sigma: float,
-                           gamma: float,
-                           T: float) -> float:
+def expected_power_utility(
+    x0: float,
+    b: float,
+    sigma: float,
+    gamma: float,
+    T: float,
+    distribution: str,
+    dist_params: dict,
+    r: float = 0.0,
+    n_steps: int = 200,
+    M: int = 500_000,
+    seed: int = None
+) -> tuple[float, np.ndarray]:
     """
-    Analytic value function for CRRA (power) utility with bounded liability F.
-
-    Returns V(x0) = (x0 - Y0)^gamma / gamma, where Y0 is the BSDE certainty equivalent:
-      - constant F:      F̄ - (γ/[2(1-γ)]) θ^2 T
-      - hedgeable Gaussian F=μ_F+κW_T:
-                          μ_F - κθ T - (γ/[2(1-γ)]) θ^2 T
+    Monte-Carlo E[U(X_T - F)] for CRRA U(x)=x^γ/γ via feedback π_t,
+    plus full matrix of π values for each path & time.
+    Falls back to expected_log_utility if γ≈1.
+    Returns (EU_mean, pi_matrix) where pi_matrix.shape == (M, n_steps).
     """
+    # γ=1 → log utility
     if abs(gamma - 1.0) < 1e-8:
-      # avoid division by zero; use log-utility closed-form
-      return expected_log_utility(pi, W_T, F_vec, x0, b, sigma, T)
+        pi_star = b / sigma**2
+        rng = np.random.default_rng(seed)
+        W_T = rng.normal(0.0, np.sqrt(T), size=M)
+        # build F_vec exactly as in main.py
+        if distribution == 'hedgable_gaussian':
+            muF = dist_params['mu_F']
+            sigmaF = dist_params['sigma_F']
+            kappa = sigmaF / np.sqrt(T)
+            F_vec = muF + kappa * W_T
+        elif distribution == 'normal':
+            F_vec = np.zeros(M)
+        else:
+            F_vec = np.full(M, dist_params['const_value'])
+        EU = expected_log_utility(pi_star, W_T, F_vec, x0, b, sigma, T)
+        # return a dummy pi_matrix for consistency
+        return EU, np.full((M, 1), pi_star)
+
+    # CRRA γ≠1
+    rng = np.random.default_rng(seed)
+    dt = T / n_steps
     theta = b / sigma
 
-    # average liability
-    try:
-      barF = float(np.mean(F_vec))
-    except:
-      barF = 0.0
+    # simulate Brownian increments and paths
+    dW = rng.normal(0.0, np.sqrt(dt), size=(M, n_steps))
+    W_path = np.cumsum(dW, axis=1)     # shape (M, n_steps)
+    W_T = W_path[:, -1]
 
-    # determine if hedgeable Gaussian (nonzero variance in F_vec)
-    if np.std(F_vec) > 1e-8:
-      mu_F = np.mean(F_vec)
-      # infer kappa via covariance with W_T
-      cov = np.cov(F_vec, W_T, bias=True)[0,1]
-      varW = np.var(W_T)
-      kappa = cov / varW if varW>0 else 0.0
-      # Y0 from Gaussian liability
-      Y0 = mu_F - kappa * theta * T - (gamma/(2*(1-gamma))) * theta**2 * T
+    # construct F and drift_Y
+    if distribution == 'hedgable_gaussian':
+        muF = dist_params['mu_F']
+        sigmaF = dist_params['sigma_F']
+        kappa = sigmaF / np.sqrt(T)
+        F = muF + kappa * W_T
+        drift_Y = kappa*theta + (gamma/(2*(1-gamma))) * theta**2
+    elif distribution == 'normal':
+        F = np.zeros(M)
+        drift_Y = (gamma/(2*(1-gamma))) * theta**2
+    else:  # constant liability
+        constF = dist_params['const_value']
+        F = np.full(M, constF)
+        drift_Y = (gamma/(2*(1-gamma))) * theta**2
+
+    # initial states
+    X = np.full(M, x0)
+    if distribution == 'hedgable_gaussian':
+        Y = np.full(M, muF - drift_Y*T)
     else:
-      # Y0 for constant liability
-      Y0 = barF - (gamma/(2*(1-gamma))) * theta**2 * T
+        barF = float(np.mean(F))
+        Y = np.full(M, barF - drift_Y*T)
 
-    H0 = x0 - Y0
-    return H0**gamma / gamma
+    # prepare matrix to store π_t for each path & step
+    pi_mat = np.zeros((M, n_steps))
+
+    # time-stepping
+    for i in range(n_steps):
+        t = i * dt
+        dW_i = dW[:, i]
+
+        # update Y_t
+        if distribution == 'hedgable_gaussian':
+            Y = muF + kappa * W_path[:, i] - drift_Y*(T - t)
+
+        # feedback π_t
+        H = X - Y
+        pi_t = H/(1-gamma) * (b / sigma**2)
+        pi_mat[:, i] = pi_t
+
+        # Euler–Maruyama for X
+        X = X + (r*X + pi_t*b) * dt + pi_t*sigma * dW_i
+
+    # compute CRRA utility
+    surplus = X - F
+    # allow negative surplus if gamma integer, otherwise mask
+    if abs(gamma - round(gamma)) < 1e-8:
+        U = surplus**gamma / gamma
+    else:
+        U = np.zeros_like(surplus)
+        mask = surplus > 0
+        U[mask] = surplus[mask]**gamma / gamma
+
+    return U.mean(), pi_mat
 
 def expected_log_utility(pi: float,
                          W_T: np.ndarray,
