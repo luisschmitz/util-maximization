@@ -55,17 +55,19 @@ def expected_power_utility(
     n_steps: int = 200,
     M: int = 500_000,
     seed: int = None
-) -> float:
+) -> tuple[float, np.ndarray]:
     """
-    Monte-Carlo E[U(X_T - F)] for CRRA U(x)=x^γ/γ via feedback π_t = H_t/(1−γ)*(b/σ²),
-    falling back to log-utility if γ≈1.
+    Monte-Carlo E[U(X_T - F)] for CRRA U(x)=x^γ/γ via feedback π_t,
+    plus full matrix of π values for each path & time.
+    Falls back to expected_log_utility if γ≈1.
+    Returns (EU_mean, pi_matrix) where pi_matrix.shape == (M, n_steps).
     """
-    # 1) γ=1: use log-utility closed-form
+    # γ=1 → log utility
     if abs(gamma - 1.0) < 1e-8:
         pi_star = b / sigma**2
         rng = np.random.default_rng(seed)
         W_T = rng.normal(0.0, np.sqrt(T), size=M)
-        # build F_vec
+        # build F_vec exactly as in main.py
         if distribution == 'hedgable_gaussian':
             muF = dist_params['mu_F']
             sigmaF = dist_params['sigma_F']
@@ -75,19 +77,21 @@ def expected_power_utility(
             F_vec = np.zeros(M)
         else:
             F_vec = np.full(M, dist_params['const_value'])
-        return expected_log_utility(pi_star, W_T, F_vec, x0, b, sigma, T)
+        EU = expected_log_utility(pi_star, W_T, F_vec, x0, b, sigma, T)
+        # return a dummy pi_matrix for consistency
+        return EU, np.full((M, 1), pi_star)
 
-    # 2) Otherwise CRRA γ≠1
+    # CRRA γ≠1
     rng = np.random.default_rng(seed)
     dt = T / n_steps
     theta = b / sigma
 
-    # simulate dW increments and cumulative W_path
+    # simulate Brownian increments and paths
     dW = rng.normal(0.0, np.sqrt(dt), size=(M, n_steps))
-    W_path = np.cumsum(dW, axis=1)  # shape (M, n_steps)
+    W_path = np.cumsum(dW, axis=1)     # shape (M, n_steps)
     W_T = W_path[:, -1]
 
-    # set liability F and Y-drift
+    # construct F and drift_Y
     if distribution == 'hedgable_gaussian':
         muF = dist_params['mu_F']
         sigmaF = dist_params['sigma_F']
@@ -97,48 +101,50 @@ def expected_power_utility(
     elif distribution == 'normal':
         F = np.zeros(M)
         drift_Y = (gamma/(2*(1-gamma))) * theta**2
-    else:  # constant
+    else:  # constant liability
         constF = dist_params['const_value']
         F = np.full(M, constF)
         drift_Y = (gamma/(2*(1-gamma))) * theta**2
 
-    # initialize X, Y
+    # initial states
     X = np.full(M, x0)
     if distribution == 'hedgable_gaussian':
-        Y = np.full(M, muF - drift_Y*T)  # at t=0, W_path=0
+        Y = np.full(M, muF - drift_Y*T)
     else:
         barF = float(np.mean(F))
         Y = np.full(M, barF - drift_Y*T)
 
-    # time-stepping (reuse dW for both X and Y)
+    # prepare matrix to store π_t for each path & step
+    pi_mat = np.zeros((M, n_steps))
+
+    # time-stepping
     for i in range(n_steps):
         t = i * dt
         dW_i = dW[:, i]
 
         # update Y_t
         if distribution == 'hedgable_gaussian':
-            Wt = W_path[:, i]
-            Y = muF + kappa*Wt - drift_Y*(T - t)
+            Y = muF + kappa * W_path[:, i] - drift_Y*(T - t)
 
-        # feedback π
+        # feedback π_t
         H = X - Y
         pi_t = H/(1-gamma) * (b / sigma**2)
+        pi_mat[:, i] = pi_t
 
         # Euler–Maruyama for X
         X = X + (r*X + pi_t*b) * dt + pi_t*sigma * dW_i
 
-    # compute U(X_T - F)
+    # compute CRRA utility
     surplus = X - F
-    is_int_gamma = abs(gamma - round(gamma)) < 1e-8
-
-    if is_int_gamma:
+    # allow negative surplus if gamma integer, otherwise mask
+    if abs(gamma - round(gamma)) < 1e-8:
         U = surplus**gamma / gamma
     else:
         U = np.zeros_like(surplus)
         mask = surplus > 0
         U[mask] = surplus[mask]**gamma / gamma
 
-    return U.mean()
+    return U.mean(), pi_mat
 
 def expected_log_utility(pi: float,
                          W_T: np.ndarray,
