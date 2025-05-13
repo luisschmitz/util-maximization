@@ -1,19 +1,22 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from functions import (
-    simulate_WT, generate_F,
-    expected_utility, expected_power_utility, expected_log_utility,
+    simulate_WT,
+    generate_F,
+    expected_utility,
+    expected_power_utility,
+    expected_log_utility,
     find_optimal_pi
 )
 from typing import Optional
+import pandas as pd
 
 # --- CONFIGURATION --------------------------------------------------------
 # Utility settings: 'exponential', 'power', or 'log'
-UTILITY_TYPE = 'power' 
+UTILITY_TYPE = 'power'
 ALPHAS = [0.5, 1.0, 2.0, 5.0]   # for exponential (α)
 GAMMAS = [0.5, 1.0, 2.0, 5.0]   # for power (γ)
-LOG_PARAMS = [None]        
- 
+
 # Liability scenarios
 SCENARIOS = [
     ('constant',          {'const_value': 0.5}),
@@ -24,9 +27,9 @@ SCENARIOS = [
 # Monte-Carlo samples
 MC_SAMPLES = 500_000
 
-# Grid-search
+# Grid-search (only used for exponential & log)
 GRID_PTS = 500
-GRID_WINDOW_RATIO = 0.1  # ±10% around analytic  # ±25% around analytic
+GRID_WINDOW_RATIO = 0.1  # ±10% around analytic
 
 # --------------------------------------------------------------------------
 def compute_analytic_pi(
@@ -44,7 +47,7 @@ def compute_analytic_pi(
     Returns None if no simple analytic form is implemented.
     """
     theta = b / sigma
-    # Exponential
+
     if utility == 'exponential':
         alpha = risk_param
         if dist == 'hedgable_gaussian':
@@ -52,25 +55,26 @@ def compute_analytic_pi(
             return kappa/sigma + b/(alpha * sigma**2)
         return b/(alpha * sigma**2)
 
-    # Power
     if utility == 'power':
         gamma = risk_param
+        # γ=1 → log utility
         if abs(gamma - 1.0) < 1e-8:
-            return b/sigma
+            return b / sigma
+
         barF = params.get('const_value', params.get('normal_mu', 0.0))
         theta2 = theta**2
-        Y0 = barF + (gamma/(2*(1-gamma))) * theta2 * T
+        # ——— FIXED SIGN HERE ———
+        Y0 = barF - (gamma/(2*(1-gamma))) * theta2 * T
         H0 = x0 - Y0
         base = (b/(sigma**2)) * (H0/(1-gamma))
         if dist == 'hedgable_gaussian':
-            muF = params['mu_F']; sigmaF = params['sigma_F']
+            muF = params['mu_F']
+            sigmaF = params['sigma_F']
             kappa = sigmaF / np.sqrt(T)
             base += kappa/sigma
         return base
 
-    # Logarithmic
     if utility == 'log':
-        # analytic π* = theta, independent of liability
         return theta
 
     return None
@@ -85,9 +89,9 @@ def test_strategy(
     dist_params: dict
 ):
     """
-    For each risk parameter, compute analytic and numeric π* for the chosen utility.
+    For each risk parameter, compute analytic π* (if available)
+    and either numeric π* (exp/log) or dynamic utility (power).
     """
-    # Choose risk parameter list
     if UTILITY_TYPE == 'exponential':
         risk_list = ALPHAS
     elif UTILITY_TYPE == 'power':
@@ -95,54 +99,63 @@ def test_strategy(
     else:
         risk_list = [None]
 
-    # Pre-simulate W_T
+    # Pre-simulate W_T for exp/log numeric search
     W_T = simulate_WT(T, MC_SAMPLES, seed=42)
     results = []
 
     for rp in risk_list:
-        # Compute analytic π*
         analytic = compute_analytic_pi(
             UTILITY_TYPE, distribution, dist_params,
             rp, b, sigma, T, x0
         )
-        # Center and grid
-        center = analytic if analytic is not None else b/(sigma**2)
-        half_width = GRID_WINDOW_RATIO * abs(center)
-        pi_grid = np.linspace(center - half_width,
-                               center + half_width,
-                               GRID_PTS)
 
-        # Numeric search
         if UTILITY_TYPE == 'exponential':
+            # build grid around analytic
+            center = analytic if analytic is not None else b/(sigma**2)
+            half_width = GRID_WINDOW_RATIO * abs(center)
+            pi_grid = np.linspace(center - half_width,
+                                   center + half_width,
+                                   GRID_PTS)
+
             pi_num, eu_vals = find_optimal_pi(
                 pi_grid, W_T,
                 distribution, dist_params,
                 x0, b, sigma, rp, T,
                 seed=42
             )
+            print(f"{distribution} | exp α={rp:.2f}: "
+                  f"analytic={analytic:.4f}, numeric={pi_num:.4f}")
+            results.append((rp, analytic, pi_num, pi_grid, eu_vals))
 
         elif UTILITY_TYPE == 'power':
-            # Build liability F_vec
-            M = W_T.shape[0]
-            if distribution == 'hedgable_gaussian':
-                muF, sigmaF = dist_params['mu_F'], dist_params['sigma_F']
-                kappa = sigmaF / np.sqrt(T)
-                F_vec = muF + kappa * W_T
-            elif distribution == 'normal':
-                F_vec = np.zeros(M)
-            else:
-                F_vec = generate_F(M, distribution,
-                                    **dist_params, seed=42)
-            # Monte-Carlo GBM power utility
-            eu_vals = np.array([
-                expected_power_utility(pi, W_T, F_vec,
-                                        x0, b, sigma, rp, T)
-                for pi in pi_grid
-            ])
-            pi_num = pi_grid[np.argmax(eu_vals)]
+            # dynamic CRRA simulation — no π-grid
+            util_dyn = expected_power_utility(
+                x0=x0,
+                b=b,
+                sigma=sigma,
+                gamma=rp,
+                T=T,
+                distribution=distribution,
+                dist_params=dist_params,
+                r=0.0,
+                n_steps=200,
+                M=MC_SAMPLES,
+                seed=42
+            )
+            print(f"{distribution} | power γ={rp:.2f}: "
+                  f"analytic π*={analytic:.4f}, simulated E[U]={util_dyn:.4f}")
+            # store (risk_param, analytic_pi, simulated_utility)
+            results.append((rp, analytic, util_dyn, None, None))
 
         else:  # logarithmic
-            # Build liability F_vec
+            # build grid around analytic
+            center = analytic if analytic is not None else b/(sigma**2)
+            half_width = GRID_WINDOW_RATIO * abs(center)
+            pi_grid = np.linspace(center - half_width,
+                                   center + half_width,
+                                   GRID_PTS)
+
+            # build liability F_vec
             M = W_T.shape[0]
             if distribution == 'hedgable_gaussian':
                 muF, sigmaF = dist_params['mu_F'], dist_params['sigma_F']
@@ -151,19 +164,15 @@ def test_strategy(
             elif distribution == 'normal':
                 F_vec = np.zeros(M)
             else:
-                F_vec = generate_F(M, distribution,
-                                    **dist_params, seed=42)
-            # Grid search for log utility
+                F_vec = generate_F(M, distribution, **dist_params, seed=42)
+
             eu_vals = np.array([
-                expected_log_utility(pi, W_T, F_vec,
-                                      x0, b, sigma, T)
+                expected_log_utility(pi, W_T, F_vec, x0, b, sigma, T)
                 for pi in pi_grid
             ])
             pi_num = pi_grid[np.argmax(eu_vals)]
-
-        print(f"{distribution} | {UTILITY_TYPE} param={rp}: "
-              f"analytic={analytic}, numeric={pi_num:.2f}")
-        results.append((rp, analytic, pi_num, pi_grid, eu_vals))
+            print(f"{distribution} | log: analytic π*={analytic:.4f}, numeric={pi_num:.4f}")
+            results.append((rp, analytic, pi_num, pi_grid, eu_vals))
 
     return results
 
@@ -179,13 +188,14 @@ def plot_results(
 ):
     """
     Plot MC utility curves and mark numeric/analytic π* on a common π axis.
+    Only for exponential & log utilities.
     """
     pi_min = min(pi[0] for _, _, _, pi, _ in results)
     pi_max = max(pi[-1] for _, _, _, pi, _ in results)
     pi_common = np.linspace(pi_min, pi_max, GRID_PTS)
 
     W_T = simulate_WT(T, MC_SAMPLES, seed=123)
-    # prepare liability vector
+    # prepare F_vec
     if distribution == 'hedgable_gaussian':
         muF, sigmaF = dist_params['mu_F'], dist_params['sigma_F']
         kappa = sigmaF / np.sqrt(T)
@@ -196,25 +206,19 @@ def plot_results(
         F_vec = generate_F(len(W_T), distribution, **dist_params, seed=123)
 
     plt.figure(figsize=(8,5))
-    for rp, analytic, pi_num, _, _ in results:
+    for rp, analytic, pi_num, pi_grid, eu_vals in results:
         if UTILITY_TYPE == 'exponential':
             U_common = [expected_utility(pi, W_T, F_vec,
                                          x0, b, sigma, rp, T)
                         for pi in pi_common]
             label = f"MC α={rp:.2f}"
-        elif UTILITY_TYPE == 'power':
-            U_common = [expected_power_utility(pi, W_T, F_vec,
-                                              x0, b, sigma, rp, T)
-                        for pi in pi_common]
-            label = f"MC γ={rp:.2f}"
-        else:
+        else:  # log
             U_common = [expected_log_utility(pi, W_T, F_vec,
-                                            x0, b, sigma, T)
+                                             x0, b, sigma, T)
                         for pi in pi_common]
             label = "MC log"
 
         plt.plot(pi_common, U_common, label=label)
-        # numeric and analytic markers
         plt.axvline(pi_num, color='k', linestyle='--',
                     label=f"Numeric π* (param={rp})")
         if analytic is not None:
@@ -230,30 +234,32 @@ def plot_results(
     plt.show()
 
 # --------------------------------------------------------------------------
-if __name__=='__main__':
+if __name__ == '__main__':
     T, b, sigma, x0 = 1.0, 0.1, 0.2, 1.0
 
-    # Store per-scenario results
     all_results = {}
+    csv_rows = []
 
     for distribution, dist_params in SCENARIOS:
         print(f"--- Scenario: {distribution} ---")
         results = test_strategy(T, b, sigma, x0, distribution, dist_params)
         all_results[distribution] = results
-        plot_results(results, T, b, sigma, x0, distribution, dist_params)
 
-        # # Exponential: π* vs α for this scenario
-        # if UTILITY_TYPE == 'exponential':
-        #     alphas = [rp for rp, *_ in results]
-        #     analytic_pis = [analytic for _, analytic, *_ in results]
-        #     numeric_pis = [pi_num for *_, pi_num, _, _ in results]
-        #     plt.figure(figsize=(6,4))
-        #     plt.plot(alphas, analytic_pis, 'o-', label='Analytic π*')
-        #     plt.plot(alphas, numeric_pis, 's--', label='Numeric π*')
-        #     plt.xlabel('Risk aversion α')
-        #     plt.ylabel('Optimal π*')
-        #     plt.title(f'Optimal π* vs α — {distribution}')
-        #     plt.legend()
-        #     plt.grid(True)
-        #     plt.tight_layout()
-        #     plt.show()
+        for rp, analytic, metric, _, _ in results:
+            row = {
+                'utility': UTILITY_TYPE,
+                'distribution': distribution,
+                'risk_param': rp,
+            }
+            if UTILITY_TYPE == 'power':
+                row['simulated_EU'] = metric
+            else:
+                row['analytic_pi'] = analytic
+                row['numeric_pi'] = metric
+            csv_rows.append(row)
+
+        if UTILITY_TYPE in ('exponential', 'log'):
+            plot_results(results, T, b, sigma, x0, distribution, dist_params)
+
+    # pd.DataFrame(csv_rows).to_csv('optimal_pi_results.csv', index=False, mode='a')
+    # print("Saved results to optimal_pi_results.csv")
